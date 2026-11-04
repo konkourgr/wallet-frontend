@@ -2,7 +2,7 @@
 .cache/
 /dist
 /config/yarn.lock
-node_modules/
+node_modules
 package_lock.json
 /build
 

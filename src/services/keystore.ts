@@ -1,5 +1,10 @@
 import * as jose from 'jose';
-import { JWK, SignJWT } from 'jose';
+import { JWK } from 'jose';
+import type { CredentialSigningKey } from './previewSignTypes';
+import type { PreviewSignClient } from './previewSign';
+import { deriveArkgPublicKey } from './arkg';
+import { fromBase64Url } from '@/util';
+import { signWalletJwt, signWithWalletKey } from './walletSigning';
 import { base58btc } from 'multiformats/bases/base58';
 import { varint } from 'multiformats';
 import * as KeyDidResolver from 'key-did-resolver';
@@ -13,12 +18,12 @@ import { SDJwt } from '@sd-jwt/core';
 import { withHintsFromAllowCredentials } from '@/util-webauthn';
 import {
 	addDeleteKeypairEvent,
+	addConfigureArkgEvent,
 	addNewKeypairEvent,
 	CurrentSchema,
 	foldState,
 	SchemaV1,
 	SchemaV2,
-	SchemaV3,
 } from './WalletStateSchema';
 import { createDeviceResponseForDcql, extractDevicePublicKeyJwkFromMdoc, type MDoc } from '../utils/mdocHolderContext';
 import { AppError } from '../errors';
@@ -240,13 +245,7 @@ export async function migrateV3PrivateData(
 	return privateData;
 }
 
-export type CredentialKeyPair = {
-	kid: string;
-	did?: string;
-	alg: string;
-	publicKey: JWK;
-	privateKey: JWK;
-};
+export type CredentialKeyPair = CredentialSigningKey;
 
 export type CredentialKeyPairV1 = {
 	kid: string;
@@ -796,6 +795,27 @@ export async function unlock(mainKey: CryptoKey, privateData: EncryptedContainer
 	};
 }
 
+/** Removing a shared passkey also deselects its seed for future issuance.
+ * Historical seed/key records remain so existing credential bindings are explicit.
+ */
+export async function deleteSharedPasskey(
+	[container, mainKey]: OpenedContainer,
+	credentialId: Uint8Array,
+): Promise<OpenedContainer> {
+	const reduced = deletePrf(container, credentialId);
+	const [data, , state] = await openPrivateData(mainKey, reduced);
+	const active = state.arkgSeeds.find((seed) => seed.id === state.activeArkgSeedId);
+	if (active?.credentialId === toBase64Url(credentialId)) {
+		return (
+			await updateWalletState(
+				[assertAsymmetricEncryptedContainer(reduced), mainKey],
+				await addConfigureArkgEvent(data, null),
+			)
+		).newContainer;
+	}
+	return [assertAsymmetricEncryptedContainer(reduced), mainKey];
+}
+
 export async function unlockPrf(
 	privateData: EncryptedContainer,
 	credential: PublicKeyCredential,
@@ -822,7 +842,7 @@ export async function unlockPrf(
 export async function init(mainKey: CryptoKey, keyInfo: AsymmetricEncryptedContainerKeys): Promise<UnlockSuccess> {
 	const privateData: EncryptedContainer = {
 		...keyInfo,
-		jwe: await encryptPrivateData(SchemaV3.WalletStateOperations.initialWalletStateContainer(), mainKey),
+		jwe: await encryptPrivateData(CurrentSchema.WalletStateOperations.initialWalletStateContainer(), mainKey),
 	};
 	return await unlock(mainKey, privateData);
 }
@@ -851,7 +871,7 @@ async function compressPublicKey(uncompressedRawPublicKey: Uint8Array): Promise<
 
 	// Get the x-coordinate
 	const x = uncompressedRawPublicKey.subarray(1, 33) as any;
-	const y = uncompressedRawPublicKey.subarray(33, 65) as any;
+	const y = uncompressedRawPublicKey[64];
 	// Determine the parity (odd or even) from the last byte
 	const parity = y % 2 === 0 ? 0x02 : 0x03;
 
@@ -902,49 +922,62 @@ async function addNewCredentialKeypairs(
 	didKeyVersion: DidKeyVersion,
 	deriveKid: (publicKey: CryptoKey, did: string | undefined) => Promise<string>,
 	numberOfKeyPairs: number = 1,
-): Promise<{
-	privateKeys: CryptoKey[];
-	keypairs: CredentialKeyPair[];
-	newPrivateData: OpenedContainer;
-}> {
-	const keypairsWithPrivateKeys = await Promise.all(
-		Array.from({ length: numberOfKeyPairs }).map(async () => {
+): Promise<{ keypairs: CredentialKeyPair[]; newPrivateData: OpenedContainer }> {
+	const [, , state] = await openPrivateData(mainKey, privateData);
+	const seed = state.activeArkgSeedId ? state.arkgSeeds.find((s) => s.id === state.activeArkgSeedId) : undefined;
+	if (state.activeArkgSeedId && !seed) throw new Error('Active ARKG seed not found');
+	if (config.PREVIEW_SIGN_ENABLED && !seed)
+		throw new Error(
+			'Complete hardware signing setup before issuing new credentials. Sign in with your compatible passkey to retry.',
+		);
+	if (seed && !config.PREVIEW_SIGN_ENABLED) throw new Error('Experimental hardware signing is disabled');
+	const keypairs = await Promise.all(
+		Array.from({ length: numberOfKeyPairs }).map(async (): Promise<CredentialKeyPair> => {
+			if (seed) {
+				const context = new TextEncoder().encode('wwWallet:holder-binding:v1');
+				const derived = deriveArkgPublicKey(
+					fromBase64Url(seed.publicSeed),
+					crypto.getRandomValues(new Uint8Array(32)),
+					context,
+				);
+				const publicKey = await crypto.subtle.importKey(
+					'jwk',
+					derived.publicKeyJwk,
+					{ name: 'ECDSA', namedCurve: 'P-256' },
+					true,
+					['verify'],
+				);
+				const did = await createDid(publicKey, didKeyVersion);
+				return {
+					type: 'arkg',
+					kid: await deriveKid(publicKey, did),
+					did,
+					alg: 'ES256',
+					publicKey: derived.publicKeyJwk,
+					seedId: seed.id,
+					ticket: toBase64Url(derived.ticket),
+					context: toBase64Url(context),
+				};
+			}
 			const { publicKey, privateKey } = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
 				'sign',
 			]);
-			const publicKeyJwk: JWK = (await crypto.subtle.exportKey('jwk', publicKey)) as JWK;
-			const privateKeyJwk = (await crypto.subtle.exportKey('jwk', privateKey)) as JWK;
 			const did = await createDid(publicKey, didKeyVersion);
-			const kid = await deriveKid(publicKey, did);
-
-			const keypair: CredentialKeyPair = {
-				kid,
+			return {
+				type: 'software',
+				kid: await deriveKid(publicKey, did),
 				did,
 				alg: 'ES256',
-				publicKey: publicKeyJwk,
-				privateKey: privateKeyJwk,
+				publicKey: (await crypto.subtle.exportKey('jwk', publicKey)) as JWK,
+				privateKey: (await crypto.subtle.exportKey('jwk', privateKey)) as JWK,
 			};
-
-			return { kid, keypair, privateKey };
 		}),
 	);
-
-	console.log('addNewredentialKeypair: Before update private data');
 	return {
-		privateKeys: keypairsWithPrivateKeys.map((k) => k.privateKey),
-		keypairs: keypairsWithPrivateKeys.map((k) => k.keypair),
-		newPrivateData: await updatePrivateData([privateData, mainKey], async (privateData: PrivateData) => {
-			// append events
-			for (const { kid, keypair } of keypairsWithPrivateKeys) {
-				privateData = await addNewKeypairEvent(privateData, kid, keypair);
-			}
-
-			return {
-				...privateData,
-				S: privateData.S,
-				events: privateData.events,
-				lastEventHash: privateData.lastEventHash ?? '',
-			};
+		keypairs,
+		newPrivateData: await updatePrivateData([privateData, mainKey], async (data: PrivateData) => {
+			for (const keypair of keypairs) data = await addNewKeypairEvent(data, keypair.kid, keypair);
+			return data;
 		}),
 	};
 }
@@ -970,6 +1003,7 @@ export async function signJwtPresentation(
 	audience: string,
 	verifiableCredentials: any[],
 	transactionDataResponseParams?: { transaction_data_hashes: string[]; transaction_data_hashes_alg: string[] },
+	hardware?: PreviewSignClient,
 ): Promise<{ vpjwt: string }> {
 	const hasher = (data: string | ArrayBuffer, alg: string) => {
 		const encoded = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data);
@@ -993,28 +1027,15 @@ export async function signJwtPresentation(
 	if (!keypair) {
 		throw new Error('Key pair not found for kid (key ID): ' + kid);
 	}
-	const { alg, privateKey } = keypair.keypair;
-	const importedPrivateKey = await crypto.subtle.importKey(
-		'jwk',
-		privateKey,
-		{ name: 'ECDSA', namedCurve: 'P-256' },
-		true,
-		['sign'],
-	);
 	const sdJwt = verifiableCredentials[0];
 	const sd_hash = toBase64Url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sdJwt)));
-	const kbJWT = await new SignJWT({
-		nonce,
-		aud: audience,
-		sd_hash,
-		...transactionDataResponseParams,
-	})
-		.setIssuedAt()
-		.setProtectedHeader({
-			typ: 'kb+jwt',
-			alg: alg,
-		})
-		.sign(importedPrivateKey);
+	const kbJWT = await signWalletJwt(
+		{ nonce, aud: audience, sd_hash, ...transactionDataResponseParams },
+		{ typ: 'kb+jwt', alg: keypair.keypair.alg },
+		keypair.keypair,
+		calculatedState.arkgSeeds,
+		hardware,
+	);
 
 	const jws = sdJwt + kbJWT;
 	return { vpjwt: jws };
@@ -1027,37 +1048,38 @@ export async function generateOpenid4vciProofs(
 	audience: string,
 	issuer: string,
 	numberOfKeyPairs: number = 1,
+	hardware?: PreviewSignClient,
 ): Promise<[{ proof_jwts: string[] }, OpenedContainer]> {
 	const deriveKid = async (publicKey: CryptoKey) => {
 		const pubKey = await crypto.subtle.exportKey('jwk', publicKey);
 		const jwkThumbprint = await jose.calculateJwkThumbprint(pubKey as JWK, 'sha256');
 		return jwkThumbprint;
 	};
-	const { privateKeys, newPrivateData, keypairs } = await addNewCredentialKeypairs(
+	const { newPrivateData, keypairs } = await addNewCredentialKeypairs(
 		container,
 		didKeyVersion,
 		deriveKid,
 		numberOfKeyPairs,
 	);
 
-	const proof_jwts = await Promise.all(
-		keypairs.map(async (keypair, index) => {
-			const privateKey = privateKeys[index];
-			const jws: string = await new SignJWT({
-				nonce: nonce,
-				aud: audience,
-				iss: issuer,
-			})
-				.setIssuedAt()
-				.setProtectedHeader({
+	const [, , state] = await openPrivateData(container[1], container[0]);
+	const proof_jwts: string[] = [];
+	// WebAuthn ceremonies must run sequentially, including batch issuance.
+	for (const keypair of keypairs) {
+		proof_jwts.push(
+			await signWalletJwt(
+				{ nonce, aud: audience, iss: issuer },
+				{
 					alg: keypair.alg,
 					typ: 'openid4vci-proof+jwt',
-					jwk: { ...keypair.publicKey, kid: keypair.kid, key_ops: ['verify'] } as JWK,
-				})
-				.sign(privateKey);
-			return jws;
-		}),
-	);
+					jwk: { ...keypair.publicKey, kid: keypair.kid, key_ops: ['verify'] },
+				},
+				keypair,
+				state.arkgSeeds,
+				hardware,
+			),
+		);
+	}
 
 	return [{ proof_jwts: proof_jwts }, newPrivateData];
 }
@@ -1092,19 +1114,18 @@ export async function generateDeviceResponse(
 	verifierEncryptionJwk?: JsonWebKey | Record<string, unknown>,
 	handoverType: 'redirect' | 'dc_api' = 'redirect',
 	dcApiOrigin?: string,
+	hardware?: PreviewSignClient,
 ): Promise<{ deviceResponseMDoc: MDoc }> {
 	const devicePublicKeyJwk = extractDevicePublicKeyJwkFromMdoc(mdocCredential);
 	const kid = await jose.calculateJwkThumbprint(devicePublicKeyJwk, 'sha256');
 	console.log('KID = ', kid);
 	// get the keypair based on the jwk Thumbprint
 	const keypair = calculatedState.keypairs.filter((k) => k.kid === kid)[0];
-	console.log('Found keypair = ', keypair);
 	if (!keypair) {
 		throw new Error('Key pair not found for kid (key ID): ' + kid);
 	}
 
-	const { alg, privateKey } = keypair.keypair;
-	const privateKeyJwk = privateKey;
+	const { alg, publicKey } = keypair.keypair;
 
 	console.log('nonce = ', nonce);
 	console.log('clientId = ', clientId);
@@ -1132,7 +1153,8 @@ export async function generateDeviceResponse(
 		dcqlQuery,
 		selectedCredentialId,
 		sessionTranscript: sessionTranscriptBytes,
-		privateKeyJwk: privateKeyJwk as JWK,
+		publicKeyJwk: publicKey,
+		sign: (data) => signWithWalletKey(keypair.keypair, calculatedState.arkgSeeds, data, hardware),
 		alg,
 		kid,
 	});
@@ -1144,6 +1166,7 @@ export async function generateDeviceResponseWithProximity(
 	mdocCredential: MDoc,
 	dcqlQuery: any,
 	sessionTranscriptBytes: any,
+	hardware?: PreviewSignClient,
 ): Promise<{ deviceResponseMDoc: MDoc }> {
 	const devicePublicKeyJwk = extractDevicePublicKeyJwkFromMdoc(mdocCredential);
 	const kid = await jose.calculateJwkThumbprint(devicePublicKeyJwk, 'sha256');
@@ -1154,14 +1177,14 @@ export async function generateDeviceResponseWithProximity(
 		throw new Error('Key pair not found for kid (key ID): ' + kid);
 	}
 
-	const { alg, privateKey } = keypair.keypair;
-	const privateKeyJwk = privateKey;
+	const { alg, publicKey } = keypair.keypair;
 
 	const deviceResponseMDoc = await createDeviceResponseForDcql({
 		mdocCredential,
 		dcqlQuery,
 		sessionTranscript: sessionTranscriptBytes as Uint8Array,
-		privateKeyJwk: privateKeyJwk as JWK,
+		publicKeyJwk: publicKey,
+		sign: (data) => signWithWalletKey(keypair.keypair, calculatedState.arkgSeeds, data, hardware),
 		alg,
 		kid,
 	});

@@ -76,4 +76,21 @@ describe('mdoc device signing COSE key', () => {
 
 		expect(params.privateKeyJwk).toEqual(original);
 	});
+
+	it('passes the exact COSE signing input to hardware using only a public JWK', async () => {
+		const { params, keyPair } = await createParams('P-256', 'ES256', 'hardware-key');
+		const { privateKeyJwk: _privateKey, ...publicParams } = params;
+		const bytes = new TextEncoder().encode('COSE Sig_structure bytes');
+		const signature = new Uint8Array(64).fill(1);
+		const sign = vi.fn(async () => signature);
+		vi.spyOn(Holder, 'createDeviceResponseForDeviceRequest').mockImplementation(async (options, context) => {
+			expect(options.signature?.signingKey.jwk.d).toBeUndefined();
+			expect(cborDecode<Map<number, unknown>>(options.signature!.signingKey.encode()).has(-4)).toBe(false);
+			const result = await context.cose.sign1.sign({ key: options.signature!.signingKey, toBeSigned: bytes });
+			expect(result).toBe(signature);
+			return {} as any;
+		});
+		await createDeviceResponseForDcql({ ...publicParams, publicKeyJwk: await exportJWK(keyPair.publicKey), sign });
+		expect(sign).toHaveBeenCalledWith(bytes);
+	});
 });

@@ -4,7 +4,7 @@ import { compareBy, last, splitWhen } from '@/util';
 import * as SchemaV1 from './WalletStateSchemaVersion1';
 import * as SchemaV2 from './WalletStateSchemaVersion2';
 import * as SchemaV3 from './WalletStateSchemaVersion3';
-import * as CurrentSchema from './WalletStateSchemaVersion3';
+import * as CurrentSchema from './WalletStateSchemaVersion4';
 import {
 	WalletSessionEvent,
 	WalletState,
@@ -18,7 +18,7 @@ import { JWK } from 'jose';
 export * as SchemaV1 from './WalletStateSchemaVersion1';
 export * as SchemaV2 from './WalletStateSchemaVersion2';
 export * as SchemaV3 from './WalletStateSchemaVersion3';
-export * as CurrentSchema from './WalletStateSchemaVersion3';
+export * as CurrentSchema from './WalletStateSchemaVersion4';
 
 const {
 	SCHEMA_VERSION,
@@ -36,6 +36,8 @@ export function getSchema(schemaVersion: number): WalletStateOperations<WalletSt
 			return SchemaV2.WalletStateOperations;
 		case 3:
 			return SchemaV3.WalletStateOperations;
+		case 4:
+			return CurrentSchema.WalletStateOperations;
 		default:
 			throw new Error(`Unknown schema version: ${schemaVersion}`);
 	}
@@ -133,6 +135,30 @@ export async function addNewKeypairEvent(
 	};
 	await validateEventHistoryContinuity(newContainer);
 	return newContainer;
+}
+
+export async function addConfigureArkgEvent(
+	container: WalletStateContainer,
+	activeSeedId: string | null,
+	seed?: import('./previewSignTypes').ArkgSeed,
+): Promise<WalletStateContainer> {
+	await validateEventHistoryContinuity(container);
+	const next = {
+		...container,
+		events: [
+			...container.events,
+			{
+				...(await createWalletSessionEvent(container)),
+				type: 'configure_arkg' as const,
+				activeSeedId,
+				...(seed ? { seed } : {}),
+			},
+		],
+	};
+	// Check seed references before encrypting or syncing the new event.
+	foldState(next);
+	await validateEventHistoryContinuity(next);
+	return next;
 }
 
 export async function addDeleteKeypairEvent(

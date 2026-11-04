@@ -1,3 +1,6 @@
+import { combinedRegistrationExtensions, getSigningAttestation } from '@/services/previewSign';
+import { activateSharedPasskeySigning } from '@/services/sharedPasskeyRegistration';
+import { transformResponse } from './response';
 import axios, { AxiosResponse } from 'axios';
 import { Err, Ok, Result } from 'ts-results';
 
@@ -35,13 +38,16 @@ type SessionState = {
 };
 
 type SignupWebauthnError =
+	| HardwareSigningSetupError
 	| 'passkeySignupFailedServerError'
 	| 'passkeySignupFailedTryAgain'
 	| 'passkeySignupFinishFailedServerError'
 	| 'passkeySignupKeystoreFailed'
 	| 'passkeySignupPrfNotSupported'
+	| 'passkeySignupPreviewSignNotSupported'
 	| { errorId: 'prfRetryFailed'; retryFrom: SignupWebauthnRetryParams };
 export type SignupWebauthnRetryParams = { beginData: any; credential: PublicKeyCredential };
+type HardwareSigningSetupError = { errorId: 'hardwareSigningSetupFailed'; message: string };
 const UNKNOWN_WEBAUTHN_CREDENTIAL_ERROR = 'UNKNOWN_WEBAUTHN_CREDENTIAL';
 
 function isRejectedWebauthnLoginFinishError(error: any): boolean {
@@ -82,6 +88,7 @@ export interface BackendApi {
 		Result<
 			void,
 			| 'loginKeystoreFailed'
+			| HardwareSigningSetupError
 			| 'passkeyInvalid'
 			| 'passkeyLoginFailedTryAgain'
 			| 'passkeyLoginFailedServerError'
@@ -157,14 +164,6 @@ export function useApi(isOnlineProp: boolean | null = true): BackendApi {
 	const getAppToken = useCallback((): string | null => {
 		return appToken;
 	}, [appToken]);
-
-	function transformResponse(data: any): any {
-		if (data) {
-			return jsonParseTaggedBinary(data);
-		} else {
-			return data;
-		}
-	}
 
 	const updatePrivateDataEtag = useCallback(
 		(resp: AxiosResponse): AxiosResponse => {
@@ -492,7 +491,7 @@ export function useApi(isOnlineProp: boolean | null = true): BackendApi {
 					console.error('Private data version conflict', { cause: 'x-private-data-etag' });
 					const cachedUser = cachedUsers?.find((u) => u.userHandleB64u === userHandle);
 					await syncPrivateData(cachedUser);
-					return;
+					throw e;
 				}
 				throw e;
 			}
@@ -546,6 +545,7 @@ export function useApi(isOnlineProp: boolean | null = true): BackendApi {
 			Result<
 				void,
 				| 'loginKeystoreFailed'
+				| HardwareSigningSetupError
 				| 'passkeyInvalid'
 				| 'passkeyLoginFailedTryAgain'
 				| 'passkeyLoginFailedServerError'
@@ -646,12 +646,19 @@ export function useApi(isOnlineProp: boolean | null = true): BackendApi {
 									// null, because then allowCredentials was empty
 									userHandle: new Uint8Array(responseUserHandle ?? userHandle),
 								},
+								isOnline
+									? (container) =>
+											activateSharedPasskeySigning(container, credential.id, (path, body) =>
+												post(path, body, { appToken: finishResp.data.appToken }),
+											)
+									: undefined,
 							);
 							if (privateDataUpdate) {
 								const [newPrivateData, keystoreCommit] = privateDataUpdate;
 								try {
 									await updatePrivateData(newPrivateData, { appToken: finishResp.data.appToken });
 									await keystoreCommit();
+									finishResp.data.privateData = serializePrivateData(newPrivateData);
 								} catch (e) {
 									console.error('Failed to upgrade PRF key', e);
 									if (e instanceof AppError && e.errorId === 'x-private-data-etag') {
@@ -664,6 +671,8 @@ export function useApi(isOnlineProp: boolean | null = true): BackendApi {
 							return Ok.EMPTY;
 						} catch (e) {
 							console.error('Failed to open keystore', e);
+							if (e instanceof AppError && e.errorId === 'hardware_signing_setup_failed')
+								return Err({ errorId: 'hardwareSigningSetupFailed', message: e.message });
 							return Err('loginKeystoreFailed');
 						}
 					} catch (e) {
@@ -717,13 +726,14 @@ export function useApi(isOnlineProp: boolean | null = true): BackendApi {
 									name,
 									displayName: name,
 								},
-								extensions: {
+								extensions: combinedRegistrationExtensions({
+									...beginData.createOptions.publicKey.extensions,
 									prf: {
 										eval: {
 											first: prfSalt,
 										},
 									},
-								},
+								}),
 								hints: webauthnHints,
 								authenticatorSelection: withAuthenticatorAttachmentFromHints(
 									beginData.createOptions.publicKey.authenticatorSelection,
@@ -731,42 +741,62 @@ export function useApi(isOnlineProp: boolean | null = true): BackendApi {
 								),
 							},
 						})) as PublicKeyCredential);
+					let signingAttestation: ArrayBuffer | undefined;
+					try {
+						signingAttestation = getSigningAttestation(credential);
+					} catch {
+						return Err('passkeySignupPreviewSignNotSupported');
+					}
 					const response = credential.response as AuthenticatorAttestationResponse;
 					console.log('created', credential);
 
 					try {
-						const privateData = await keystore.initPrf(credential, prfSalt, promptForPrfRetry, {
-							displayName: name,
-							userHandle: beginData.createOptions.publicKey.user.id,
-						});
-
-						try {
-							const finishResp = updatePrivateDataEtag(
-								await post('/user/register-webauthn-finish', {
-									challengeId: beginData.challengeId,
-									displayName: name,
-									privateData: serializePrivateData(privateData),
-									credential: {
-										type: credential.type,
-										id: credential.id,
-										rawId: credential.rawId,
-										response: {
-											attestationObject: response.attestationObject,
-											clientDataJSON: response.clientDataJSON,
-											transports: response.getTransports(),
+						let finishResp: AxiosResponse | undefined;
+						const privateData = await keystore.initPrf(
+							credential,
+							prfSalt,
+							promptForPrfRetry,
+							{
+								displayName: name,
+								userHandle: beginData.createOptions.publicKey.user.id,
+							},
+							async (container) => {
+								finishResp = updatePrivateDataEtag(
+									await post('/user/register-webauthn-finish', {
+										challengeId: beginData.challengeId,
+										signingAttestation,
+										displayName: name,
+										privateData: serializePrivateData(container[0]),
+										credential: {
+											type: credential.type,
+											id: credential.id,
+											rawId: credential.rawId,
+											response: {
+												attestationObject: response.attestationObject,
+												clientDataJSON: response.clientDataJSON,
+												transports: response.getTransports(),
+											},
+											authenticatorAttachment: credential.authenticatorAttachment,
+											clientExtensionResults: credential.getClientExtensionResults(),
 										},
-										authenticatorAttachment: credential.authenticatorAttachment,
-										clientExtensionResults: credential.getClientExtensionResults(),
-									},
-								}),
-							);
-							await setSession(finishResp, credential, 'signup');
-							return Ok.EMPTY;
-						} catch (e) {
-							return Err('passkeySignupFailedServerError');
-						}
+									}),
+								);
+								const token = finishResp.data.appToken;
+								const configured = await activateSharedPasskeySigning(container, credential.id, (path, body) =>
+									post(path, body, { appToken: token }),
+								);
+								if (configured !== container) await updatePrivateData(configured[0], { appToken: token });
+								return configured;
+							},
+						);
+						if (!finishResp) return Err('passkeySignupFailedServerError');
+						finishResp.data.privateData = serializePrivateData(privateData);
+						await setSession(finishResp, credential, 'signup');
+						return Ok.EMPTY;
 					} catch (e) {
-						if (e instanceof AppError && e.errorId === 'prf_retry_failed') {
+						if (e instanceof AppError && e.errorId === 'hardware_signing_setup_failed') {
+							return Err({ errorId: 'hardwareSigningSetupFailed', message: e.message });
+						} else if (e instanceof AppError && e.errorId === 'prf_retry_failed') {
 							return Err({ errorId: 'prfRetryFailed', retryFrom: { credential, beginData } });
 						} else if (e instanceof AppError && e.errorId === 'prf_not_supported') {
 							return Err('passkeySignupPrfNotSupported');
@@ -781,7 +811,7 @@ export function useApi(isOnlineProp: boolean | null = true): BackendApi {
 				return Err('passkeySignupFinishFailedServerError');
 			}
 		},
-		[post, updatePrivateDataEtag, setSession],
+		[post, updatePrivateData, updatePrivateDataEtag, setSession],
 	);
 
 	const addEventListener = useCallback(

@@ -4,6 +4,7 @@ export type AppErrorId =
 	| 'keystore_not_asymmetric'
 	| 'prf_not_supported'
 	| 'prf_retry_failed'
+	| 'hardware_signing_setup_failed'
 	| 'x-private-data-etag';
 
 export class AppError extends Error {

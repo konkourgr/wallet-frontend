@@ -185,7 +185,9 @@ export async function createDeviceResponseForDcql(params: {
 	dcqlQuery: any;
 	selectedCredentialId?: string;
 	sessionTranscript: Uint8Array;
-	privateKeyJwk: JWK;
+	privateKeyJwk?: JWK;
+	publicKeyJwk?: JWK;
+	sign?: (data: Uint8Array) => Promise<Uint8Array>;
 	alg: string;
 	kid: string;
 }): Promise<MDoc> {
@@ -198,12 +200,20 @@ export async function createDeviceResponseForDcql(params: {
 			issuerSigned: [issuerSigned],
 			signature: {
 				signingKey: createDeviceSigningCoseKey({
-					...params.privateKeyJwk,
+					...(params.publicKeyJwk ?? params.privateKeyJwk),
 					alg: params.alg,
 					kid: params.kid,
 				} as Record<string, unknown>),
 			},
 		},
-		mdocContext,
+		params.sign
+			? {
+					...mdocContext,
+					cose: {
+						...mdocContext.cose,
+						sign1: { ...mdocContext.cose.sign1, sign: async ({ toBeSigned }) => params.sign!(toBeSigned) },
+					},
+				}
+			: mdocContext,
 	);
 }

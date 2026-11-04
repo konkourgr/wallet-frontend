@@ -1,4 +1,4 @@
-import { WalletState, WalletStateCredential } from '@/services/WalletStateSchemaVersion3';
+import { WalletState, WalletStateCredential } from '@/services/WalletStateSchemaVersion4';
 import { compareBy } from '../../util';
 import { ExtendedVcEntity } from '@/context/CredentialsContext';
 

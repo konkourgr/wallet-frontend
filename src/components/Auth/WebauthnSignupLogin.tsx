@@ -173,6 +173,10 @@ const WebauthnSignupLogin = ({
 		if (result.ok) {
 			setIsAwaitingRedirect(true);
 		} else {
+			if (typeof result.val !== 'string') {
+				setError(result.val.message);
+				return;
+			}
 			// Using a switch here so the t() argument can be a literal, to ease searching
 			switch (result.val) {
 				case 'loginKeystoreFailed':
@@ -236,6 +240,14 @@ const WebauthnSignupLogin = ({
 					setError(t('loginSignup.passkeySignupKeystoreFailed'));
 					break;
 
+				case 'passkeySignupPreviewSignNotSupported':
+					setError(
+						t('loginSignup.passkeySignupPreviewSignNotSupported', {
+							defaultValue:
+								'Hardware signing requires a passkey supporting both PRF and previewSign v4. Use a compatible security key and client.',
+						}),
+					);
+					break;
 				case 'passkeySignupPrfNotSupported':
 					setError(
 						<Trans
@@ -255,7 +267,9 @@ const WebauthnSignupLogin = ({
 					break;
 
 				default:
-					if (result.val?.errorId === 'prfRetryFailed') {
+					if (result.val?.errorId === 'hardwareSigningSetupFailed') {
+						setError(result.val.message);
+					} else if (result.val?.errorId === 'prfRetryFailed') {
 						setRetrySignupFrom(result.val?.retryFrom);
 					} else {
 						setError(t('loginSignup.passkeySignupPrfRetryFailed'));

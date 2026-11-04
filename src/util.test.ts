@@ -1,5 +1,15 @@
 import { assert, describe, it } from 'vitest';
-import { compareBy } from './util';
+import { compareBy, fromBase64Url, jsonParseTaggedBinary, jsonStringifyTaggedBinary, toBase64Url } from './util';
+
+describe('binary views', () => {
+	it('encodes only the requested byte range of a pooled buffer', () => {
+		const pool = new Uint8Array([99, 1, 2, 3, 99]);
+		const view = pool.subarray(1, 4);
+		assert.deepEqual(fromBase64Url(toBase64Url(view)), new Uint8Array([1, 2, 3]));
+		assert.deepEqual(jsonParseTaggedBinary(jsonStringifyTaggedBinary({ view })).view, new Uint8Array([1, 2, 3]));
+		assert.equal(toBase64Url(new DataView(pool.buffer, 1, 3)), toBase64Url(view));
+	});
+});
 
 describe('compareBy', () => {
 	it('sorts by Date objects as expected.', async () => {

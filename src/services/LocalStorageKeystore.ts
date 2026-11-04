@@ -22,6 +22,7 @@ import type {
 import { WalletStateUtils } from './WalletStateUtils';
 import {
 	addAlterSettingsEvent,
+	addConfigureArkgEvent,
 	addDeleteCredentialEvent,
 	addDeleteCredentialIssuanceSessionEvent,
 	addDeleteKeypairEvent,
@@ -37,6 +38,8 @@ import { UserId } from '@/api/types';
 import { getItem } from '@/indexedDB';
 import { WalletStateContainerGeneric } from './WalletStateSchemaCommon';
 import { AppError } from '../errors';
+import type { ArkgSeed } from './previewSignTypes';
+import type { PreviewSignClient } from './previewSign';
 
 type MDoc =
 	| {
@@ -75,6 +78,7 @@ export enum KeystoreEvent {
 }
 
 export type CommitCallback = () => Promise<void>;
+export type PreparePrfContainer = (container: OpenedContainer) => Promise<OpenedContainer>;
 
 export function shouldMergeOpenKeystore(
 	hasOpenKeystore: boolean,
@@ -85,6 +89,10 @@ export function shouldMergeOpenKeystore(
 }
 
 export interface LocalStorageKeystore {
+	configureArkg(
+		activeSeedId: string | null,
+		seed?: ArkgSeed,
+	): Promise<[{}, AsymmetricEncryptedContainer, CommitCallback]>;
 	isOpen(): boolean;
 	close(): Promise<void>;
 
@@ -93,17 +101,20 @@ export interface LocalStorageKeystore {
 		prfSalt: Uint8Array,
 		promptForPrfRetry: () => Promise<boolean | AbortSignal>,
 		user: UserData,
+		prepare?: PreparePrfContainer,
 	): Promise<EncryptedContainer>;
 	addPrf(
 		credential: PublicKeyCredential,
 		promptForPrfRetry: () => Promise<boolean | AbortSignal>,
+		prepare?: PreparePrfContainer,
 	): Promise<[EncryptedContainer, CommitCallback]>;
-	deletePrf(credentialId: Uint8Array): [EncryptedContainer, CommitCallback];
+	deletePrf(credentialId: Uint8Array): Promise<[EncryptedContainer, CommitCallback]>;
 	unlockPrf(
 		privateData: EncryptedContainer,
 		credential: PublicKeyCredential,
 		promptForPrfRetry: () => Promise<boolean | AbortSignal>,
 		user: CachedUser | UserData,
+		prepare?: PreparePrfContainer,
 	): Promise<[EncryptedContainer, CommitCallback] | null>;
 	getPrfKeyInfo(id: ArrayBuffer | ArrayBufferView): WebauthnPrfEncryptionKeyInfo | undefined;
 	getPasswordOrPrfKeyFromSession(
@@ -175,7 +186,7 @@ export interface LocalStorageKeystore {
 }
 
 /** A stateful wrapper around the keystore module, storing state in the browser's localStorage and sessionStorage. */
-export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageKeystore {
+export function useLocalStorageKeystore(eventTarget: EventTarget, hardware?: PreviewSignClient): LocalStorageKeystore {
 	const [cachedUsers, setCachedUsers] = useLocalStorage<CachedUser[]>('cachedUsers', []);
 	const [privateData, setPrivateData] = useState<EncryptedContainer | null>(null);
 
@@ -577,8 +588,15 @@ export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageK
 			mainKey: CryptoKey,
 			keyInfo: AsymmetricEncryptedContainerKeys,
 			user: UserData,
+			prepare?: PreparePrfContainer,
 		): Promise<EncryptedContainer> => {
 			const unlocked = await keystore.init(mainKey, keyInfo);
+			if (prepare) {
+				[unlocked.privateData, unlocked.mainKey] = await prepare([
+					keystore.assertAsymmetricEncryptedContainer(unlocked.privateData),
+					unlocked.mainKey,
+				]);
+			}
 			const privateData = await finishUnlock(unlocked, user, null, async () => false);
 			return privateData;
 		},
@@ -591,9 +609,10 @@ export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageK
 			prfSalt: Uint8Array<ArrayBuffer>,
 			promptForPrfRetry: () => Promise<boolean | AbortSignal>,
 			user: UserData,
+			prepare?: PreparePrfContainer,
 		): Promise<EncryptedContainer> => {
 			const { mainKey, keyInfo } = await keystore.initPrf(credential, prfSalt, promptForPrfRetry);
-			const result = await init(mainKey, keyInfo, user);
+			const result = await init(mainKey, keyInfo, user, prepare);
 			return result;
 		},
 		[init],
@@ -625,38 +644,42 @@ export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageK
 		async (
 			credential: PublicKeyCredential,
 			promptForPrfRetry: () => Promise<boolean | AbortSignal>,
+			prepare?: PreparePrfContainer,
 		): Promise<[EncryptedContainer, CommitCallback]> => {
 			const [privateData, mainKey] = await assertKeystoreOpen();
 			if (!userHandleB64u) {
 				throw new Error('User handle is not set');
 			}
-			const newPrivateData = await keystore.addPrf(privateData, credential, mainKey, promptForPrfRetry);
+			let newPrivateData = await keystore.addPrf(privateData, credential, mainKey, promptForPrfRetry);
+			let newMainKey = mainKey;
+			if (prepare)
+				[newPrivateData, newMainKey] = await prepare([
+					keystore.assertAsymmetricEncryptedContainer(newPrivateData),
+					mainKey,
+				]);
+			const [, , state] = await keystore.openPrivateData(newMainKey, newPrivateData);
 			return [
 				newPrivateData,
 				async () => {
 					await writePrivateDataOnIdb(newPrivateData, userHandleB64u);
 					setPrivateData(newPrivateData);
+					setMainKey(await keystore.exportMainKey(newMainKey));
+					setCalculatedWalletState(state);
 				},
 			];
 		},
-		[setPrivateData, writePrivateDataOnIdb, userHandleB64u, assertKeystoreOpen],
+		[setPrivateData, setMainKey, writePrivateDataOnIdb, userHandleB64u, assertKeystoreOpen],
 	);
 
 	const deletePrf = useCallback(
-		(credentialId: Uint8Array): [EncryptedContainer, CommitCallback] => {
-			if (!privateData || !userHandleB64u) {
-				throw new Error('Keystore is not open');
-			}
-			const newPrivateData = keystore.deletePrf(privateData, credentialId);
-			return [
-				newPrivateData,
-				async () => {
-					await writePrivateDataOnIdb(newPrivateData, userHandleB64u);
-					setPrivateData(newPrivateData);
-				},
-			];
+		async (credentialId: Uint8Array): Promise<[EncryptedContainer, CommitCallback]> => {
+			const [, container, commit] = await editPrivateData(async (original) => [
+				{},
+				await keystore.deleteSharedPasskey(original, credentialId),
+			]);
+			return [container, commit];
 		},
-		[privateData, setPrivateData, writePrivateDataOnIdb, userHandleB64u],
+		[editPrivateData],
 	);
 
 	const unlockPrf = useCallback(
@@ -665,8 +688,15 @@ export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageK
 			credential: PublicKeyCredential,
 			promptForPrfRetry: () => Promise<boolean | AbortSignal>,
 			user: CachedUser | UserData | null,
+			prepare?: PreparePrfContainer,
 		): Promise<[EncryptedContainer, CommitCallback] | null> => {
 			const [unlockPrfResult] = await keystore.unlockPrf(encryptedPrivateData, credential, promptForPrfRetry);
+			if (prepare) {
+				[unlockPrfResult.privateData, unlockPrfResult.mainKey] = await prepare([
+					keystore.assertAsymmetricEncryptedContainer(unlockPrfResult.privateData),
+					unlockPrfResult.mainKey,
+				]);
+			}
 			const updatedPrivateData = await finishUnlock(unlockPrfResult, user, credential, promptForPrfRetry);
 			return updatedPrivateData ? [updatedPrivateData, async () => {}] : null;
 		},
@@ -724,8 +754,9 @@ export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageK
 				audience,
 				verifiableCredentials,
 				transactionDataResponseParams,
+				hardware,
 			),
-		[openPrivateData],
+		[openPrivateData, hardware],
 	);
 
 	const generateDeviceResponse = useCallback(
@@ -751,8 +782,9 @@ export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageK
 				verifierEncryptionJwk,
 				handoverType,
 				dcApiOrigin,
+				hardware,
 			)) as unknown as { deviceResponseMDoc: MDoc },
-		[openPrivateData],
+		[openPrivateData, hardware],
 	);
 
 	const generateDeviceResponseWithProximity = useCallback(
@@ -762,8 +794,9 @@ export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageK
 				mdocCredential as any,
 				dcqlQuery,
 				sessionTranscriptBytes,
+				hardware,
 			)) as unknown as { deviceResponseMDoc: MDoc },
-		[openPrivateData],
+		[openPrivateData, hardware],
 	);
 
 	const isOpen = useCallback((): boolean => {
@@ -783,9 +816,10 @@ export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageK
 					audience,
 					issuer,
 					requests.length,
+					hardware,
 				);
 			}),
-		[editPrivateData],
+		[editPrivateData, hardware],
 	);
 
 	const generateKeypairs = useCallback(
@@ -970,6 +1004,21 @@ export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageK
 		[editPrivateData, openPrivateData],
 	);
 
+	const configureArkg = useCallback(
+		async (
+			activeSeedId: string | null,
+			seed?: ArkgSeed,
+		): Promise<[{}, AsymmetricEncryptedContainer, CommitCallback]> => {
+			return editPrivateData(async (originalContainer) => {
+				const [data] = await keystore.openPrivateData(originalContainer[1], originalContainer[0]);
+				const updated = await addConfigureArkgEvent(data, activeSeedId, seed);
+				const { newContainer } = await keystore.updateWalletState(originalContainer, updated);
+				return [{}, newContainer];
+			});
+		},
+		[editPrivateData],
+	);
+
 	return useMemo(
 		() => ({
 			isOpen,
@@ -998,6 +1047,7 @@ export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageK
 			saveCredentialIssuanceSessions,
 			getCredentialIssuanceSessionByState,
 			alterSettings,
+			configureArkg,
 		}),
 		[
 			isOpen,
@@ -1026,6 +1076,7 @@ export function useLocalStorageKeystore(eventTarget: EventTarget): LocalStorageK
 			saveCredentialIssuanceSessions,
 			getCredentialIssuanceSessionByState,
 			alterSettings,
+			configureArkg,
 		],
 	);
 }

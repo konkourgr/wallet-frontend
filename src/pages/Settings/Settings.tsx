@@ -39,7 +39,8 @@ import {
 	Trash2,
 	UserCog,
 } from 'lucide-react';
-import { APP_VERSION, WEBAUTHN_RPID } from '@/config';
+import { APP_VERSION, WEBAUTHN_RPID, PREVIEW_SIGN_ENABLED } from '@/config';
+import HardwareSigning from './components/HardwareSigning';
 import { clearWalletCache } from '@/services/clearWalletCache';
 import { signalAllAcceptedCredentials } from '@/util-webauthn';
 
@@ -262,7 +263,7 @@ const Settings = () => {
 	}, [refreshData]);
 
 	const deleteWebauthnCredential = async (credential: WebauthnCredential) => {
-		const [newPrivateData, keystoreCommit] = keystore.deletePrf(credential.credentialId);
+		const [newPrivateData, keystoreCommit] = await keystore.deletePrf(credential.credentialId);
 		try {
 			const deleteResp = api.updatePrivateDataEtag(
 				await api.post(`/user/session/webauthn/credential/${credential.id}/delete`, {
@@ -572,6 +573,14 @@ const Settings = () => {
 
 								{activeTab === 'account' && (
 									<>
+										{PREVIEW_SIGN_ENABLED && (
+											<SettingsSection
+												title={t('hardwareSigning.title', { defaultValue: 'Hardware signing (experimental)' })}
+												icon={<KeyRound size={18} />}
+											>
+												<HardwareSigning credentials={userData.webauthnCredentials} />
+											</SettingsSection>
+										)}
 										<SettingsSection
 											title={t('pageSettings.title.manageOtherPasskeys')}
 											icon={<KeyRound size={18} />}

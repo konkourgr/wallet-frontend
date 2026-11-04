@@ -1,3 +1,5 @@
+import { getSigningAttestation, combinedRegistrationExtensions } from '@/services/previewSign';
+import { activateSharedPasskeySigning } from '@/services/sharedPasskeyRegistration';
 import React, { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -46,6 +48,7 @@ const WebauthnRegistration = ({ onSuccess }: { onSuccess: () => void }) => {
 	const [prfRetryAccepted, setPrfRetryAccepted] = useState(false);
 	const { t } = useTranslation();
 	const abortControllerRef = useRef<AbortController | null>(null);
+	const [error, setError] = useState('');
 	const [menuOpen, setMenuOpen] = useState(false);
 	const [menuAlign, setMenuAlign] = useState<'left' | 'right'>('right');
 	const menuRef = useRef<HTMLDivElement | null>(null);
@@ -79,6 +82,7 @@ const WebauthnRegistration = ({ onSuccess }: { onSuccess: () => void }) => {
 	const onBegin = useCallback(
 		async (webauthnHint: string) => {
 			setBeginData(null);
+			setError('');
 			setIsSubmitting(true);
 			setPendingCredential(null);
 
@@ -97,6 +101,7 @@ const WebauthnRegistration = ({ onSuccess }: { onSuccess: () => void }) => {
 					signal: abortController.signal,
 					publicKey: {
 						...beginData.createOptions.publicKey,
+						extensions: combinedRegistrationExtensions(beginData.createOptions.publicKey.extensions),
 						hints,
 						authenticatorSelection: withAuthenticatorAttachmentFromHints(
 							beginData.createOptions.publicKey.authenticatorSelection ?? {},
@@ -110,11 +115,11 @@ const WebauthnRegistration = ({ onSuccess }: { onSuccess: () => void }) => {
 					if (!(credential instanceof PublicKeyCredential)) {
 						throw new Error('Failed to create public key credential');
 					}
-					console.log('created', credential);
+					getSigningAttestation(credential);
 					setPendingCredential(credential);
 				} catch (e) {
 					if (!(e instanceof DOMException && e.name === 'AbortError')) {
-						console.error('Failed to register', e);
+						setError(e instanceof Error ? e.message : 'Passkey registration failed');
 					}
 					setBeginData(null);
 					setPendingCredential(null);
@@ -143,44 +148,53 @@ const WebauthnRegistration = ({ onSuccess }: { onSuccess: () => void }) => {
 		console.log('onFinish', event);
 
 		if (beginData && pendingCredential) {
+			setIsSubmitting(true);
+			setError('');
 			try {
 				const response = pendingCredential.response as AuthenticatorAttestationResponse;
-				const [newPrivateData, keystoreCommit] = await keystore.addPrf(pendingCredential, async () => {
-					setNeedPrfRetry(true);
-					return new Promise<boolean>((resolve, _reject) => {
-						setResolvePrfRetryPrompt(() => resolve);
-					}).finally(() => {
-						setNeedPrfRetry(false);
-						setPrfRetryAccepted(true);
-						setResolvePrfRetryPrompt(null);
-					});
-				});
-
-				setIsSubmitting(true);
-				api.updatePrivateDataEtag(
-					await api.post('/user/session/webauthn/register-finish', {
-						challengeId: beginData.challengeId,
-						name,
-						credential: {
-							type: pendingCredential.type,
-							id: pendingCredential.id,
-							rawId: pendingCredential.rawId,
-							response: {
-								attestationObject: response.attestationObject,
-								clientDataJSON: response.clientDataJSON,
-								transports: response.getTransports(),
-							},
-							authenticatorAttachment: pendingCredential.authenticatorAttachment,
-							clientExtensionResults: pendingCredential.getClientExtensionResults(),
-						},
-						privateData: serializePrivateData(newPrivateData),
-					}),
+				const [, keystoreCommit] = await keystore.addPrf(
+					pendingCredential,
+					async () => {
+						setNeedPrfRetry(true);
+						return new Promise<boolean>((resolve, _reject) => {
+							setResolvePrfRetryPrompt(() => resolve);
+						}).finally(() => {
+							setNeedPrfRetry(false);
+							setPrfRetryAccepted(true);
+							setResolvePrfRetryPrompt(null);
+						});
+					},
+					async (container) => {
+						api.updatePrivateDataEtag(
+							await api.post('/user/session/webauthn/register-finish', {
+								challengeId: beginData.challengeId,
+								signingAttestation: getSigningAttestation(pendingCredential),
+								name,
+								credential: {
+									type: pendingCredential.type,
+									id: pendingCredential.id,
+									rawId: pendingCredential.rawId,
+									response: {
+										attestationObject: response.attestationObject,
+										clientDataJSON: response.clientDataJSON,
+										transports: response.getTransports(),
+									},
+									authenticatorAttachment: pendingCredential.authenticatorAttachment,
+									clientExtensionResults: pendingCredential.getClientExtensionResults(),
+								},
+								privateData: serializePrivateData(container[0]),
+							}),
+						);
+						const configured = await activateSharedPasskeySigning(container, pendingCredential.id, api.post);
+						if (configured !== container) await api.updatePrivateData(configured[0]);
+						return configured;
+					},
 				);
+				await keystoreCommit();
 				onSuccess();
 				setName('');
-				await keystoreCommit();
 			} catch (e) {
-				console.error('Failed to finish registration', e);
+				setError(e instanceof Error ? e.message : 'Passkey registration failed');
 				if (e instanceof AppError && e.errorId === 'x-private-data-etag') {
 					// TODO: Show this error to the user
 					throw new AppError('x-private-data-etag', 'Private data version conflict', { cause: e });
@@ -197,6 +211,11 @@ const WebauthnRegistration = ({ onSuccess }: { onSuccess: () => void }) => {
 
 	return (
 		<div ref={menuRef} className="relative inline-block">
+			{error && !stateChooseName && (
+				<p role="alert" className="text-sm text-lm-red dark:text-dm-red">
+					{error}
+				</p>
+			)}
 			<button
 				id="add-passkey-trigger"
 				type="button"
@@ -241,6 +260,11 @@ const WebauthnRegistration = ({ onSuccess }: { onSuccess: () => void }) => {
 				<form onSubmit={onFinish}>
 					{pendingCredential ? (
 						<>
+							{error && (
+								<p role="alert" className="text-sm text-lm-red dark:text-dm-red">
+									{error}
+								</p>
+							)}
 							<H2 heading={t('registerPasskey.messageSuccess')} hr={false} flexJustifyContent="center" />
 							<p className="mb-2 text-lm-gray-800 dark:text-dm-gray-200">{t('registerPasskey.giveName')}</p>
 							<input

@@ -7,6 +7,8 @@
 
 Welcome to wwWallet Frontend repository! This application is a user-friendly web wallet that empowers users to manage their digital credentials effortlessly. With a seamless interface and powerful features, users can view their credentials, obtain new ones from issuers, present credentials to verifiers, and access their presentation history.
 
+The `previewSign-single-key` branch uses one passkey for PRF wallet unlocking and experimental ARKG hardware holder signing. See the [setup, compatibility, and testing guide](docs/preview-sign.md).
+
 ## Table of Contents
 
 - ✨ [Features](#features)

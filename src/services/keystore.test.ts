@@ -1,4 +1,4 @@
-import { assert, describe, it } from 'vitest';
+import { assert, describe, it, vi } from 'vitest';
 import * as jose from 'jose';
 
 import * as util from '@cef-ebsi/key-did-resolver/dist/util.js';
@@ -6,6 +6,12 @@ import * as util from '@cef-ebsi/key-did-resolver/dist/util.js';
 import * as keystore from './keystore.js';
 import { byteArrayEquals, fromBase64, jsonParseTaggedBinary, toBase64, toBase64Url } from '../util';
 import { DidKeyVersion } from '../config.js';
+
+// This suite covers the explicit software-only mode and existing wallet formats.
+vi.mock('@/config', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/config')>()),
+	PREVIEW_SIGN_ENABLED: false,
+}));
 
 async function asyncAssertThrows(fn: () => Promise<any>, message: string): Promise<unknown> {
 	try {
@@ -185,7 +191,9 @@ describe('The keystore', () => {
 			);
 			assert.equal(keypairs.length, numKeys);
 			const [, , calculatedState] = await keystore.openPrivateData(newMainKey, newPrivateData);
-			for (const { kid, publicKey, privateKey } of keypairs) {
+			for (const key of keypairs) {
+				if (key.type === 'arkg') throw new Error('Expected software key');
+				const { kid, publicKey, privateKey } = key;
 				const { publicKey: storedPublicKey } = calculatedState.keypairs.filter((keypair) => keypair.kid === kid)[0]
 					.keypair;
 				assert.deepEqual(publicKey, storedPublicKey);

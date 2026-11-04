@@ -8,7 +8,7 @@ export function toU8<T extends ArrayBufferLike>(b: ArrayBuffer | ArrayBufferView
 	if (b instanceof ArrayBuffer) {
 		return new Uint8Array(b);
 	} else {
-		return new Uint8Array(b.buffer);
+		return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
 	}
 }
 

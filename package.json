@@ -48,7 +48,9 @@
     "workbox-precaching": "^7.3.0",
     "workbox-routing": "^7.3.0",
     "workbox-strategies": "^7.3.0",
-    "zod": "^4.6.7"
+    "zod": "^4.6.7",
+    "@noble/hashes": "1.8.0",
+    "cbor-x": "^1.6.4"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",

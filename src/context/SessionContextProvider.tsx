@@ -9,11 +9,13 @@ import { useLocalStorage, useSessionStorage } from '@/hooks/useStorage';
 import { fetchKeyConfig, HpkeConfig } from '@/lib/utils/ohttpHelpers';
 import { OHTTP_KEY_CONFIG } from '@/config';
 import { setAppBadgeCount } from '@/utils';
+import { createPreviewSignClient } from '@/services/previewSign';
 
 export const SessionContextProvider = ({ children }: React.PropsWithChildren) => {
 	const { isOnline } = useContext(StatusContext);
 	const api = useApi(isOnline);
-	const keystore = useLocalStorageKeystore(keystoreEvents);
+	const hardwareSigning = useMemo(() => createPreviewSignClient(api.post), [api.post]);
+	const keystore = useLocalStorageKeystore(keystoreEvents, hardwareSigning);
 	const { getCalculatedWalletState } = keystore;
 	const isLoggedIn = useMemo(() => api.isLoggedIn() && keystore.isOpen(), [keystore, api]);
 
