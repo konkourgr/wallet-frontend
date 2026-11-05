@@ -101,6 +101,10 @@ export default defineConfig(async ({ mode }) => {
 			open: true,
 		},
 		build: {
+			// Linked wallet-common resolves outside node_modules but still emits CommonJS.
+			commonjsOptions: {
+				include: [/node_modules/, /[/\\]wallet-common[/\\]dist[/\\]/],
+			},
 			manifest: true,
 			sourcemap: env.GENERATE_SOURCEMAP === 'true',
 			minify: env.GENERATE_SOURCEMAP !== 'true',
